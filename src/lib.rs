@@ -93,7 +93,7 @@ impl Write for Discard {
     }
 }
 
-const MIN_WIDTH: usize = 3;
+const MIN_WIDTH: usize = 32; // JJ: Changed 3 to 32.
 
 /// Size information/estimate
 #[derive(Debug, Copy, Clone)]
