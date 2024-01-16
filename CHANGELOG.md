@@ -9,6 +9,91 @@ Possible log types:
 - `[fixed]` for any bug fixes.
 - `[security]` to invite users to upgrade in case of vulnerabilities.
 
+### 0.11.0
+
+- [fixed] CSS: rules marked !important were ignored.
+- [changed] html\_trace feature now uses the `log` crate.
+- [changed] Bumped MSRV to 1.63 (matching Debian stable) due to some dependencies.
+
+### 0.10.3
+
+- [fixed] A panic on some unlucky text wrapping coincidences.
+- [fixed] Use dep:backtrace in Cargo.toml to avoid implicit feature.
+
+### 0.10.2
+
+- [fixed] CSS: Ignore transparent colours.
+
+### 0.10.1
+
+- [fixed] `max_width` was not working with some render methods.
+
+### 0.10.0
+
+- [added] Simple support for `<i>`, `<ins>`, and `<del>` (thanks sgtatham)
+- [added] Added background-color support
+- [fixed] CSS support didn't work in some places, such as `<td>` elements.
+- [added] Add support for `style` attributes.
+- [added] Styles apply to table borders
+- [changed] Update some dependencies
+- [fixed] Fix a few places which caused excess blank lines or empty tables
+
+### 0.9.4
+
+- [changed] Updated the termion dev-dependency to 2.0.
+
+### 0.9.3
+
+- [changed] Added cargo categories and update to 2021 edition.
+
+### 0.9.2
+
+- [fixed] CSS didn't work inside `<ul>` or `<ol>`.
+- [added] Add methods to get and use the intermediate HTML DOM and RenderTree
+  from Config.
+- [fixed] Removed some clones which are no longer necessary now that Box<FnOnce>
+  works.
+
+### 0.9.1
+
+- [fixed] Various documentation issues (thanks sgtatham)
+- [changed] CSS color rules now work for elements other than span.
+
+### 0.9.0
+
+- [changed] `Config::add_css` now returns `Result` instead of panicking on
+  CSS parse errors.  Errors from parsing document CSS are ignored.
+- [added] Support `<font color=...>` when CSS is enabled.
+- [added] `Config::max_wrap_width()` to wrap text to a norrower width than
+  the overal size available.
+- [added] Add --wrap-width and --css options to html2text example.
+
+### 0.8.0
+
+- [added] CSS: Support more extensive selectors
+- [changed] CSS handling defaults to off; use `Config::use_doc_css()`
+  or `Config::add_css` to use CSS.
+
+### 0.7.1
+
+- [added] Now recognised CSS `display:none`
+- [added] Can now add extra CSS rules via `Config::add_css`.
+- [changed] StyleData::coloured is no longer public.
+
+### 0.7.0
+
+- [changed] Remove some noisy stderr output when encoutering control chars
+  (thanks sftse)
+- [added] A builder-based config API.
+- [changed] Updated MSRV to 1.60
+- [fixed] Fixed #88: panic when a width of zero passed in (thanks bingen13)
+- [fixed] Fixed #90: Fixed a divide-by-zero panic with colspan=0 (thanks mtorromeo)
+- [added] Add very basic CSS colour support (under the css feature flag)
+- [changed] Removed ansi\_colours feature (from\_read\_coloured is always available)
+- [changed] Overhauled error handling.  Internally (and in the lower level
+  API) errors (mainly "TooNarrow") are passed around with `Result`.  Fixed
+  some panics and infinite loops.  (Thanks WIZeaz for fuzzing)
+
 ### 0.6.0
 
 - [changed] Improve layout of tables thanks to sftse:
