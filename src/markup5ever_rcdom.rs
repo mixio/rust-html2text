@@ -36,28 +36,27 @@
 //! [tree structure]: https://en.wikipedia.org/wiki/Tree_(data_structure)
 //! [dom wiki]: https://en.wikipedia.org/wiki/Document_Object_Model
 
-extern crate markup5ever;
 extern crate tendril;
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
-use std::default::Default;
 use std::fmt;
 use std::io;
 use std::mem;
 use std::rc::{Rc, Weak};
 
+use html5ever::interface::ElemName;
 use tendril::StrTendril;
 
-use markup5ever::interface::tree_builder;
-use markup5ever::interface::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
-use markup5ever::serialize::TraversalScope;
-use markup5ever::serialize::TraversalScope::{ChildrenOnly, IncludeNode};
-use markup5ever::serialize::{Serialize, Serializer};
-use markup5ever::Attribute;
-use markup5ever::ExpandedName;
-use markup5ever::QualName;
+use html5ever::interface::tree_builder;
+use html5ever::interface::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
+use html5ever::serialize::TraversalScope;
+use html5ever::serialize::TraversalScope::{ChildrenOnly, IncludeNode};
+use html5ever::serialize::{Serialize, Serializer};
+use html5ever::Attribute;
+use html5ever::ExpandedName;
+use html5ever::QualName;
 
 /// The different kinds of nodes in the DOM.
 #[derive(Debug)]
@@ -123,13 +122,46 @@ impl Node {
             children: RefCell::new(Vec::new()),
         })
     }
+
+    pub fn get_parent(&self) -> Option<Rc<Self>> {
+        if let Some(parent) = self.parent.take() {
+            let parent_handle = parent.upgrade();
+            self.parent.set(Some(parent));
+            parent_handle
+        } else {
+            None
+        }
+    }
+
+    /// Return the nth child element of this node, or None.
+    pub fn nth_child(&self, idx: usize) -> Option<Rc<Self>> {
+        let mut element_idx = 0;
+        for child in self.children.borrow().iter() {
+            if let NodeData::Element { .. } = child.data {
+                element_idx += 1;
+                if element_idx == idx {
+                    return Some(child.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Return the element type (if an element)
+    pub fn element_name(&self) -> Option<String> {
+        if let NodeData::Element { ref name, .. } = self.data {
+            Some(format!("{}", name.local_name()))
+        } else {
+            None
+        }
+    }
 }
 
 impl Drop for Node {
     fn drop(&mut self) {
-        let mut nodes = mem::replace(&mut *self.children.borrow_mut(), vec![]);
+        let mut nodes = mem::take(&mut *self.children.borrow_mut());
         while let Some(node) = nodes.pop() {
-            let children = mem::replace(&mut *node.children.borrow_mut(), vec![]);
+            let children = mem::take(&mut *node.children.borrow_mut());
             nodes.extend(children.into_iter());
             if let NodeData::Element {
                 ref template_contents,
@@ -169,23 +201,20 @@ fn append(new_parent: &Handle, child: Handle) {
 
 /// If the node has a parent, get it and this node's position in its children
 fn get_parent_and_index(target: &Handle) -> Option<(Handle, usize)> {
-    if let Some(weak) = target.parent.take() {
-        let parent = weak.upgrade().expect("dangling weak pointer");
-        target.parent.set(Some(weak));
-        let i = match parent
-            .children
-            .borrow()
-            .iter()
-            .enumerate()
-            .find(|&(_, child)| Rc::ptr_eq(&child, &target))
-        {
-            Some((i, _)) => i,
-            None => panic!("have parent but couldn't find in parent's children!"),
-        };
-        Some((parent, i))
-    } else {
-        None
-    }
+    let weak = target.parent.take()?;
+    let parent = weak.upgrade().expect("dangling weak pointer");
+    target.parent.set(Some(weak));
+    let i = match parent
+        .children
+        .borrow()
+        .iter()
+        .enumerate()
+        .find(|&(_, child)| Rc::ptr_eq(child, target))
+    {
+        Some((i, _)) => i,
+        None => panic!("have parent but couldn't find in parent's children!"),
+    };
+    Some((parent, i))
 }
 
 fn append_to_existing_text(prev: &Handle, text: &str) -> bool {
@@ -211,29 +240,90 @@ pub struct RcDom {
     pub document: Handle,
 
     /// Errors that occurred during parsing.
-    pub errors: Vec<Cow<'static, str>>,
+    pub errors: RefCell<Vec<Cow<'static, str>>>,
 
     /// The document's quirks mode.
-    pub quirks_mode: QuirksMode,
+    pub quirks_mode: Cell<QuirksMode>,
+}
+
+impl RcDom {
+    fn add_node_to_string(s: &mut String, node: &Handle, indent: usize) {
+        use std::fmt::Write as _;
+        match &node.data {
+            NodeData::Document => {
+                for child in &*node.children.borrow() {
+                    Self::add_node_to_string(s, child, indent);
+                }
+            }
+            NodeData::Doctype { .. } => {
+                writeln!(s, "{0:indent$}<doctype>", "", indent = indent).unwrap();
+            }
+            NodeData::Text { contents } => {
+                let borrowed = contents.borrow();
+                let text = borrowed.to_string();
+                if !text.trim().is_empty() {
+                    writeln!(s, "{0:indent$}Text:{1}", "", text, indent = indent).unwrap();
+                }
+            }
+            NodeData::Comment { .. } => (),
+            NodeData::Element { name, .. } => {
+                writeln!(s, "{0:indent$}<{1}>", "", name.local, indent = indent).unwrap();
+                for child in &*node.children.borrow() {
+                    Self::add_node_to_string(s, child, indent + 1);
+                }
+                writeln!(s, "{0:indent$}</{1}>", "", name.local, indent = indent).unwrap();
+            }
+            NodeData::ProcessingInstruction { .. } => {}
+        }
+    }
+
+    /// A low-quality debug DOM rendering.
+    pub fn as_dom_string(&self) -> String {
+        let mut s = String::new();
+        Self::add_node_to_string(&mut s, &self.document, 0);
+        s
+    }
+
+    /// A low-quality debug DOM rendering of an individual node
+    pub fn node_as_dom_string(node: &Handle) -> String {
+        let mut s = String::new();
+        Self::add_node_to_string(&mut s, node, 0);
+        s
+    }
+
+    /// Find the node at a child path starting from the root element.  At each level, 1 is the
+    /// first child element, and only elements are counted.
+    pub fn get_node_by_path(&self, path: &[usize]) -> Option<Handle> {
+        let mut node = self.document.clone();
+        for idx in path {
+            node = match node.nth_child(*idx) {
+                Some(new_node) => new_node,
+                None => return None,
+            };
+        }
+        Some(node)
+    }
 }
 
 impl TreeSink for RcDom {
     type Output = Self;
+
+    type ElemName<'a> = ExpandedName<'a>;
     fn finish(self) -> Self {
         self
     }
 
     type Handle = Handle;
 
-    fn parse_error(&mut self, msg: Cow<'static, str>) {
-        self.errors.push(msg);
+    fn parse_error(&self, msg: Cow<'static, str>) {
+        self.errors.borrow_mut().push(msg);
     }
 
-    fn get_document(&mut self) -> Handle {
+    fn get_document(&self) -> Handle {
         self.document.clone()
     }
 
-    fn get_template_contents(&mut self, target: &Handle) -> Handle {
+    fn get_template_contents(&self, target: &Handle) -> Handle {
         if let NodeData::Element {
             ref template_contents,
             ..
@@ -249,8 +339,8 @@ impl TreeSink for RcDom {
         }
     }
 
-    fn set_quirks_mode(&mut self, mode: QuirksMode) {
-        self.quirks_mode = mode;
+    fn set_quirks_mode(&self, mode: QuirksMode) {
+        self.quirks_mode.set(mode);
     }
 
     fn same_node(&self, x: &Handle, y: &Handle) -> bool {
@@ -258,18 +348,13 @@ impl TreeSink for RcDom {
     }
 
     fn elem_name<'a>(&self, target: &'a Handle) -> ExpandedName<'a> {
-        return match target.data {
+        match target.data {
             NodeData::Element { ref name, .. } => name.expanded(),
             _ => panic!("not an element!"),
-        };
+        }
     }
 
-    fn create_element(
-        &mut self,
-        name: QualName,
-        attrs: Vec<Attribute>,
-        flags: ElementFlags,
-    ) -> Handle {
+    fn create_element(&self, name: QualName, attrs: Vec<Attribute>, flags: ElementFlags) -> Handle {
         Node::new(NodeData::Element {
             name,
             attrs: RefCell::new(attrs),
@@ -282,33 +367,29 @@ impl TreeSink for RcDom {
         })
     }
 
-    fn create_comment(&mut self, text: StrTendril) -> Handle {
+    fn create_comment(&self, text: StrTendril) -> Handle {
         Node::new(NodeData::Comment { contents: text })
     }
 
-    fn create_pi(&mut self, target: StrTendril, data: StrTendril) -> Handle {
+    fn create_pi(&self, target: StrTendril, data: StrTendril) -> Handle {
         Node::new(NodeData::ProcessingInstruction {
             target,
             contents: data,
         })
     }
 
-    fn append(&mut self, parent: &Handle, child: NodeOrText<Handle>) {
+    fn append(&self, parent: &Handle, child: NodeOrText<Handle>) {
         // Append to an existing Text node if we have one.
-        match child {
-            NodeOrText::AppendText(ref text) => match parent.children.borrow().last() {
-                Some(h) => {
-                    if append_to_existing_text(h, &text) {
-                        return;
-                    }
+        if let NodeOrText::AppendText(text) = &child {
+            if let Some(h) = parent.children.borrow().last() {
+                if append_to_existing_text(h, text) {
+                    return;
                 }
-                _ => (),
-            },
-            _ => (),
+            }
         }
 
         append(
-            &parent,
+            parent,
             match child {
                 NodeOrText::AppendText(text) => Node::new(NodeData::Text {
                     contents: RefCell::new(text),
@@ -318,8 +399,8 @@ impl TreeSink for RcDom {
         );
     }
 
-    fn append_before_sibling(&mut self, sibling: &Handle, child: NodeOrText<Handle>) {
-        let (parent, i) = get_parent_and_index(&sibling)
+    fn append_before_sibling(&self, sibling: &Handle, child: NodeOrText<Handle>) {
+        let (parent, i) = get_parent_and_index(sibling)
             .expect("append_before_sibling called on node without parent");
 
         let child = match (child, i) {
@@ -354,7 +435,7 @@ impl TreeSink for RcDom {
     }
 
     fn append_based_on_parent_node(
-        &mut self,
+        &self,
         element: &Self::Handle,
         prev_element: &Self::Handle,
         child: NodeOrText<Self::Handle>,
@@ -371,7 +452,7 @@ impl TreeSink for RcDom {
     }
 
     fn append_doctype_to_document(
-        &mut self,
+        &self,
         name: StrTendril,
         public_id: StrTendril,
         system_id: StrTendril,
@@ -386,7 +467,7 @@ impl TreeSink for RcDom {
         );
     }
 
-    fn add_attrs_if_missing(&mut self, target: &Handle, attrs: Vec<Attribute>) {
+    fn add_attrs_if_missing(&self, target: &Handle, attrs: Vec<Attribute>) {
         let mut existing = if let NodeData::Element { ref attrs, .. } = target.data {
             attrs.borrow_mut()
         } else {
@@ -404,21 +485,21 @@ impl TreeSink for RcDom {
         );
     }
 
-    fn remove_from_parent(&mut self, target: &Handle) {
-        remove_from_parent(&target);
+    fn remove_from_parent(&self, target: &Handle) {
+        remove_from_parent(target);
     }
 
-    fn reparent_children(&mut self, node: &Handle, new_parent: &Handle) {
+    fn reparent_children(&self, node: &Handle, new_parent: &Handle) {
         let mut children = node.children.borrow_mut();
         let mut new_children = new_parent.children.borrow_mut();
         for child in children.iter() {
-            let previous_parent = child.parent.replace(Some(Rc::downgrade(&new_parent)));
+            let previous_parent = child.parent.replace(Some(Rc::downgrade(new_parent)));
             assert!(Rc::ptr_eq(
-                &node,
+                node,
                 &previous_parent.unwrap().upgrade().expect("dangling weak")
             ))
         }
-        new_children.extend(mem::replace(&mut *children, Vec::new()));
+        new_children.extend(mem::take(&mut *children));
     }
 
     fn is_mathml_annotation_xml_integration_point(&self, target: &Handle) -> bool {
@@ -438,8 +519,8 @@ impl Default for RcDom {
     fn default() -> RcDom {
         RcDom {
             document: Node::new(NodeData::Document),
-            errors: vec![],
-            quirks_mode: tree_builder::NoQuirks,
+            errors: vec![].into(),
+            quirks_mode: tree_builder::NoQuirks.into(),
         }
     }
 }
@@ -495,11 +576,11 @@ impl Serialize for SerializableHandle {
                         }
                     }
 
-                    NodeData::Doctype { ref name, .. } => serializer.write_doctype(&name)?,
+                    NodeData::Doctype { ref name, .. } => serializer.write_doctype(name)?,
 
                     NodeData::Text { ref contents } => serializer.write_text(&contents.borrow())?,
 
-                    NodeData::Comment { ref contents } => serializer.write_comment(&contents)?,
+                    NodeData::Comment { ref contents } => serializer.write_comment(contents)?,
 
                     NodeData::ProcessingInstruction {
                         ref target,

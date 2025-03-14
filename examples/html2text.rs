@@ -1,23 +1,25 @@
 extern crate argparse;
 extern crate html2text;
 use argparse::{ArgumentParser, Store, StoreOption, StoreTrue};
-use html2text::config::{Config, self};
-use html2text::render::text_renderer::{TextDecorator, TrivialDecorator};
+use html2text::config::{self, Config};
+use html2text::render::{TextDecorator, TrivialDecorator};
+use log::trace;
 use std::io;
 use std::io::Write;
-use log::trace;
 
 #[cfg(unix)]
-use html2text::render::text_renderer::RichAnnotation;
+use html2text::render::RichAnnotation;
 #[cfg(unix)]
-use termion;
-
-#[cfg(unix)]
-fn default_colour_map(annotations: &[RichAnnotation], s: &str) -> String {
+fn default_colour_map(
+    annotations: &[RichAnnotation],
+    s: &str,
+    use_css_colours: bool,
+    no_default_colours: bool,
+) -> String {
     use termion::color::*;
     use RichAnnotation::*;
     // Explicit CSS colours override any other colours
-    let mut have_explicit_colour = false;
+    let mut have_explicit_colour = no_default_colours;
     let mut start = Vec::new();
     let mut finish = Vec::new();
     trace!("default_colour_map: str={s}, annotations={annotations:?}");
@@ -63,13 +65,17 @@ fn default_colour_map(annotations: &[RichAnnotation], s: &str) -> String {
                 }
             }
             Colour(c) => {
-                start.push(format!("{}", Fg(Rgb(c.r, c.g, c.b))));
-                finish.push(format!("{}", Fg(Reset)));
-                have_explicit_colour = true;
+                if use_css_colours {
+                    start.push(format!("{}", Fg(Rgb(c.r, c.g, c.b))));
+                    finish.push(format!("{}", Fg(Reset)));
+                    have_explicit_colour = true;
+                }
             }
             BgColour(c) => {
-                start.push(format!("{}", Bg(Rgb(c.r, c.g, c.b))));
-                finish.push(format!("{}", Bg(Reset)));
+                if use_css_colours {
+                    start.push(format!("{}", Bg(Rgb(c.r, c.g, c.b))));
+                    finish.push(format!("{}", Bg(Reset)));
+                }
             }
             _ => {}
         }
@@ -93,6 +99,15 @@ fn update_config<T: TextDecorator>(mut config: Config<T>, flags: &Flags) -> Conf
     if flags.use_css {
         config = config.use_doc_css();
     }
+    match (flags.link_footnotes, flags.no_link_footnotes) {
+        (true, true) => {
+            eprintln!("Error: can't specify both --link-footnotes and --no-link-footnotes");
+            std::process::exit(1);
+        }
+        (true, false) => config = config.link_footnotes(true),
+        (false, true) => config = config.link_footnotes(false),
+        (false, false) => {}
+    };
     config
 }
 
@@ -105,23 +120,53 @@ where
         if flags.use_colour {
             let conf = config::rich();
             let conf = update_config(conf, &flags);
-            return conf.coloured(input, flags.width, default_colour_map)
-                    .unwrap()
+            #[cfg(feature = "css")]
+            let use_css_colours = !flags.ignore_css_colours;
+            #[cfg(not(feature = "css"))]
+            let use_css_colours = false;
+            #[cfg(feature = "css")]
+            let use_only_css = flags.use_only_css;
+            #[cfg(not(feature = "css"))]
+            let use_only_css = false;
+            return conf
+                .coloured(input, flags.width, move |anns, s| {
+                    default_colour_map(anns, s, use_css_colours, use_only_css)
+                })
+                .unwrap();
         }
     }
-    if literal {
+    #[cfg(feature = "css")]
+    {
+        if flags.show_css {
+            let conf = config::plain();
+            let conf = update_config(conf, &flags);
+            let dom = conf.parse_html(input).unwrap();
+            return html2text::dom_to_parsed_style(&dom).expect("Parsing CSS");
+        }
+    }
+    if flags.show_dom {
+        let conf = config::plain();
+        let conf = update_config(conf, &flags);
+        let dom = conf.parse_html(input).unwrap();
+        dom.as_dom_string()
+    } else if flags.show_render {
+        let conf = config::plain();
+        let conf = update_config(conf, &flags);
+        let dom = conf.parse_html(input).unwrap();
+        let rendertree = conf.dom_to_render_tree(&dom).unwrap();
+        rendertree.to_string()
+    } else if literal {
         let conf = config::with_decorator(TrivialDecorator::new());
         let conf = update_config(conf, &flags);
-        conf.string_from_read(input, flags.width)
-            .unwrap()
+        conf.string_from_read(input, flags.width).unwrap()
     } else {
         let conf = config::plain();
         let conf = update_config(conf, &flags);
-        conf.string_from_read(input, flags.width)
-            .unwrap()
+        conf.string_from_read(input, flags.width).unwrap()
     }
 }
 
+#[derive(Debug)]
 struct Flags {
     width: usize,
     wrap_width: Option<usize>,
@@ -129,6 +174,16 @@ struct Flags {
     use_colour: bool,
     #[cfg(feature = "css")]
     use_css: bool,
+    #[cfg(feature = "css")]
+    ignore_css_colours: bool,
+    #[cfg(feature = "css")]
+    use_only_css: bool,
+    show_dom: bool,
+    show_render: bool,
+    #[cfg(feature = "css")]
+    show_css: bool,
+    link_footnotes: bool,
+    no_link_footnotes: bool,
 }
 
 fn main() {
@@ -143,6 +198,16 @@ fn main() {
         use_colour: false,
         #[cfg(feature = "css")]
         use_css: false,
+        #[cfg(feature = "css")]
+        ignore_css_colours: false,
+        #[cfg(feature = "css")]
+        use_only_css: false,
+        show_dom: false,
+        show_render: false,
+        #[cfg(feature = "css")]
+        show_css: false,
+        link_footnotes: false,
+        no_link_footnotes: false,
     };
     let mut literal: bool = false;
 
@@ -173,20 +238,58 @@ fn main() {
             StoreTrue,
             "Output only literal text (no decorations)",
         );
+        ap.refer(&mut flags.link_footnotes).add_option(
+            &["--link-footnotes"],
+            StoreTrue,
+            "Enable link footnotes",
+        );
+        ap.refer(&mut flags.no_link_footnotes).add_option(
+            &["--no-link-footnotes"],
+            StoreTrue,
+            "Enable link footnotes",
+        );
         #[cfg(unix)]
-        ap.refer(&mut flags.use_colour)
-            .add_option(&["--colour"], StoreTrue, "Use ANSI terminal colours");
+        ap.refer(&mut flags.use_colour).add_option(
+            &["--colour"],
+            StoreTrue,
+            "Use ANSI terminal colours",
+        );
         #[cfg(feature = "css")]
         ap.refer(&mut flags.use_css)
             .add_option(&["--css"], StoreTrue, "Enable CSS");
+        #[cfg(feature = "css")]
+        ap.refer(&mut flags.ignore_css_colours)
+            .add_option(&["--ignore-css-colour"], StoreTrue, "With --css, ignore CSS colour information (still hides elements with e.g. display: none)");
+        #[cfg(feature = "css")]
+        ap.refer(&mut flags.use_only_css).add_option(
+            &["--only-css"],
+            StoreTrue,
+            "Don't use default non-CSS colours",
+        );
+        ap.refer(&mut flags.show_dom).add_option(
+            &["--show-dom"],
+            StoreTrue,
+            "Show the parsed HTML DOM instead of rendered output",
+        );
+        ap.refer(&mut flags.show_render).add_option(
+            &["--show-render"],
+            StoreTrue,
+            "Show the computed render tree instead of the rendered output",
+        );
+        #[cfg(feature = "css")]
+        ap.refer(&mut flags.show_css).add_option(
+            &["--show-css"],
+            StoreTrue,
+            "Show the parsed CSS instead of rendered output",
+        );
         ap.parse_args_or_exit();
     }
 
     let data = match infile {
         None => {
             let stdin = io::stdin();
-            let data = translate(&mut stdin.lock(), flags, literal);
-            data
+
+            translate(&mut stdin.lock(), flags, literal)
         }
         Some(name) => {
             let mut file = std::fs::File::open(name).expect("Tried to open file");
